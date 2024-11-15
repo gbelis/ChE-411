@@ -2,13 +2,15 @@ import cobra
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
+from matplotlib.colors import ListedColormap,TwoSlopeNorm, LinearSegmentedColormap,Normalize
+from scipy.interpolate import griddata
+
 import numpy as np
 import itertools
 
 
-def build_BOF(model, df, name):
-    reaction = cobra.Reaction(id = name, name = name)
+def build_BOF(model, df, name, reaction_name):
+    reaction = cobra.Reaction(id = reaction_name, name = reaction_name)
     data = df.loc[name][:-2].reset_index()
     idx = data[data['index'] == '->'].index[0]
     data = pd.concat([data[:idx], data[idx+1:]])
@@ -18,7 +20,6 @@ def build_BOF(model, df, name):
     reaction.add_metabolites({model.metabolites.get_by_id(met.replace('[', '_').replace(']', '')): stoch for stoch, met in zip(data[name], data['index'])})
     return reaction
 
-# Creating conditions
 def BOF_test(model, objective, BOF, BOF_bounds = (0,1000)):
     model.objective = objective
     model.reactions.get_by_id(BOF).bounds = BOF_bounds
@@ -48,7 +49,6 @@ def FBA(model, objective):
     else:
         return 0
 
-
 def pFBA_rq(model, BOF):
     model.objective = BOF
     try:
@@ -59,53 +59,40 @@ def pFBA_rq(model, BOF):
         else:
             return rq
     except Exception as e:
-        print(f"Error in pFBA: {e}")
+        #print(f"Error in pFBA: {e}")
         return 0
-    
-
-
-# Setting the bounds of all biomass reactions to zero initially
 
 def fig_1_row(model,  BOF, res = 10, tol = 1e-10):
-    model.reactions.get_by_id(BOF).bounds = (0, 0)
+    for biomass in ['UL', 'NL', 'CL', 'BIOMASS_Ec_iML1515_core_75p37M', 'BIOMASS_Ec_iML1515_WT_75p37M']:
+        model.reactions.get_by_id(biomass).bounds = (0, 0)
 
     # Define glucose and ammonium uptake ranges
     ammonium = -np.linspace(0,20, res)
-    glucose = -np.linspace(0, 20, res)
+    glucose = -np.linspace(0,20, res)
 
     # Dataframe to store results
     df = pd.DataFrame(columns=['BOF','Glucose', 'Ammonium', 'Growth', 'Acetate', 'RQ'])
-
+   
+    best_growth = 0
     # Loop over glucose and ammonium uptake combinations
     for am, gl in itertools.product(glucose, ammonium):
         # Set the bounds for glucose and ammonium uptake
-        model.reactions.get_by_id('EX_glc__D_e').bounds = (gl, 10)
-        model.reactions.get_by_id('EX_nh4_e').bounds = (am, 10)
+        model.reactions.get_by_id('EX_glc__D_e').bounds = (gl, gl)
+        model.reactions.get_by_id('EX_nh4_e').bounds = (am, am)
         model.reactions.get_by_id('EX_ac_e').bounds = (0,1000)
-        if isinstance(BOF, str):
-            model.reactions.get_by_id(BOF).bounds = (0,1000)
-        elif isinstance(BOF, dict):
-            for reaction in BOF.keys():
-                reaction.bounds = (0,1000)
+        model.reactions.get_by_id(BOF).bounds = (0,1000)
         row = [BOF, -gl, -am]
 
         # Step 1: Maximize growth (BOF)
         model.objective = BOF
         sol = model.optimize('maximize')
-        
-        # If optimization is successful, append the growth value
-        if sol.status == 'optimal':
-            growth_flux = sol.objective_value
-            if growth_flux>tol:
-                row.append(sol.objective_value)
-            else: 
-                row += [-100,-100,-100]
-                continue
-        else:
-            # print(f'no feasible solution for\nGlucose:\t{gl}\nAmmonium:\t{am}')
-            row += [-100,-100,-100]
+        growth_flux = FBA(model, BOF)
+        if growth_flux>tol and best_growth<growth_flux:
+            row.append(sol.objective_value)
+        else: 
+            row += [0,0,0]
             df.loc[len(df.index)] = row
-            continue  # Skip the rest if growth is 0 (no feasible solution)
+            continue
 
         # Step 2: Fix the growth rate to the optimized value
         if isinstance(BOF, str):
@@ -116,34 +103,81 @@ def fig_1_row(model,  BOF, res = 10, tol = 1e-10):
 
 
         # Step 3: Maximize acetate secretion
-        model.objective = 'EX_ac_e'
-        sol = model.optimize('maximize')
-        
-        # If optimization is successful, append the acetate secretion value
-        if sol.status == 'optimal':
-            acetate_flux = sol.fluxes['EX_ac_e']
-            row.append(acetate_flux)
-        else:
-            row.append(0)
-            acetate_flux = 0  # Just for fixing bounds later
+        acetate_flux = FBA(model, 'EX_ac_e')
+        row.append(acetate_flux)
 
         # Step 4: Fix acetate secretion rate
         model.reactions.get_by_id('EX_ac_e').bounds = (acetate_flux, acetate_flux)
 
         # Step 5: Perform parsimonious FBA (pFBA)
-        model.objective = BOF
-        try:
-            sol = cobra.flux_analysis.pfba(model)
-            if sol.status == 'optimal' and sol.fluxes['EX_o2_e'] != 0:
-                rq = - sol.fluxes['EX_co2_e'] / sol.fluxes['EX_o2_e']
-                row.append(rq)
-            else:
-                row.append(0)
-        except Exception as e:
-            print(f"Error in pFBA: {e}")
-            row.append(0)
+        row.append(pFBA_rq(model, BOF))
+        
         # Append row to dataframe
         df.loc[len(df.index)] = row
+    
+    # Reset BOF bounds after the loop
+    model.reactions.get_by_id(BOF).bounds = (0,1000)
+
+    return df
+
+def BTW(model,  BOFs, res = 10, tol = 1e-10):
+    for biomass in BOFs + ['BIOMASS_Ec_iML1515_core_75p37M', 'BIOMASS_Ec_iML1515_WT_75p37M']:
+        model.reactions.get_by_id(biomass).bounds = (0, 0)
+
+    # Define glucose and ammonium uptake ranges
+    ammonium = -np.linspace(0,20, res)
+    glucose = -np.linspace(0,20, res)
+
+    # Dataframe to store results
+    df = pd.DataFrame(columns=['BOF','Glucose', 'Ammonium', 'Growth', 'Acetate', 'RQ'])
+   
+    best_growth = 0
+    # Loop over glucose and ammonium uptake combinations
+    for am, gl in itertools.product(glucose, ammonium):
+        for w in zip(np.linspace(0, 1, 11), 1-np.linspace(0, 1, 11)):
+            # Set the bounds for glucose and ammonium uptake
+            model.reactions.get_by_id('EX_glc__D_e').bounds = (gl, gl)
+            model.reactions.get_by_id('EX_nh4_e').bounds = (am, am)
+            model.reactions.get_by_id('EX_ac_e').bounds = (0,1000)
+            BOF={model.reactions.get_by_id(bof): w for bof, w in zip(BOFs, w)}
+            if isinstance(BOF, str):
+                model.reactions.get_by_id(BOF).bounds = (0,1000)
+            elif isinstance(BOF, dict):
+                for reaction in BOF.keys():
+                    reaction.bounds = (0,1000)
+            row = [{reaction.name: w for reaction,w in BOF.items()}, -gl, -am]
+
+            # Step 1: Maximize growth (BOF)
+            model.objective = BOF
+            sol = model.optimize('maximize')
+            growth_flux = FBA(model, BOF)
+            if growth_flux>tol and best_growth<growth_flux:
+                row.append(sol.objective_value)
+            else: 
+                row += [0,0,0]
+                df.loc[len(df.index)] = row
+                continue
+
+            # Step 2: Fix the growth rate to the optimized value
+            if isinstance(BOF, str):
+                model.reactions.get_by_id(BOF).bounds = (growth_flux, growth_flux)
+            elif isinstance(BOF, dict):
+                for reaction, w in BOF.items():
+                    reaction.bounds = (w*growth_flux,w*growth_flux)
+
+
+            # Step 3: Maximize acetate secretion
+            acetate_flux = FBA(model, 'EX_ac_e')
+            row.append(acetate_flux)
+
+            # Step 4: Fix acetate secretion rate
+            model.reactions.get_by_id('EX_ac_e').bounds = (acetate_flux, acetate_flux)
+
+            # Step 5: Perform parsimonious FBA (pFBA)
+            row.append(pFBA_rq(model, BOF))
+            
+            # Append row to dataframe
+            df.loc[len(df.index)] = row
     
     # Reset BOF bounds after the loop
     if isinstance(BOF, str):
@@ -152,64 +186,60 @@ def fig_1_row(model,  BOF, res = 10, tol = 1e-10):
         for reaction in BOF.keys():
             reaction.bounds = (0,1000)
     return df
-   
 
-
-def fig_1(model, df = None):
+def fig_1(model, df = None, res=10):
     dfs = []
-    BOFs = ['WT', 'NitStarv', 'CarbStarv']
-    for bof, in BOFs:
-        df = fig_1_row(model, bof)
+    BOFs = ['UL', 'NL', 'CL']
+    for bof in BOFs:
+        df = fig_1_row(model, bof, res=res)
         dfs.append(df.copy())
     return pd.concat(dfs,axis=0)
 
-
 # Plotting functions
-def plot_heatmap(data, ax, metric, vmax = None):
+
+def plot_heatmap(data, ax, metric, vmax = None, mask=None, cmap='rocket', norm=None):
     # Reshape data for heatmap
     heatmap_data = data.pivot(index='Glucose', columns='Ammonium', values=metric)
-
-    
-    # Mask -100 values by treating them as NaN temporarily
-    # heatmap_data[heatmap_data<1e-10] Does not work
-    mask_special_value = heatmap_data == -100
-    heatmap_data = heatmap_data.replace(-100, np.nan)
-
-    # Define the base colormap for the heatmap (excluding -100 values)
-    vmin = 0
-    if not vmax: vmax = 0, heatmap_data.max()
-    cmap = plt.cm.inferno
+    if vmax == None:
+        vmax=heatmap_data.max(axis=None)
+    if norm is None:
+        norm=Normalize(vmin=0,vmax=vmax)
 
     # Plot the heatmap, masking NaNs (including original -100 values)
     sns.heatmap(
-        heatmap_data, cmap=cmap,vmin = vmin, vmax=vmax, mask=mask_special_value, annot=False, fmt=".1f", ax=ax,
-        cbar_kws={'label': 'Values'}
+        heatmap_data, vmax=vmax,vmin=0, annot=False, fmt=".1f", ax=ax,
+        cbar_kws={'label': 'Values'}, cmap=cmap, norm=norm
     )
 
-    # Overlay special values (-100) as light grey
-    sns.heatmap(
-        heatmap_data.replace(np.nan, -100), cmap=ListedColormap(['lightgrey']), mask=~mask_special_value, 
-        annot=False, cbar=False, ax=ax
-    )
+    # Grey area mask
+    if not mask is None:
+        sns.heatmap(
+            data=mask, cmap=ListedColormap(['lightgrey']), 
+            annot=False, cbar=False, ax=ax, mask=~mask
+        )
 
     # Customize axes and labels
     ax.invert_yaxis()
     ax.set_ylabel('Glucose uptake')
     ax.set_xlabel('Ammonium uptake') 
 
-
 def fig_1_plot(df):
-    BOFs = ['WT', 'NitStarv', 'CarbStarv']
+    BOFs = ['UL', 'NL', 'CL']
     metrics = ['Growth', 'Acetate', 'RQ']
     fig, axes = plt.subplots(3, 3, figsize=(18, 8), sharey=True, sharex=True)
     if isinstance(df, pd.core.frame.DataFrame): 
         for bof, ax_row in zip(BOFs, axes):
             d = df[df['BOF']==bof]
+            mask = d.pivot(index='Glucose', columns='Ammonium', values='Growth') < 1e-10
             for metric, ax in zip(metrics, ax_row):
-                plot_heatmap(d, ax, metric, vmax=df[metric].max())
+                if metric=='RQ': cmap,norm=get_unity_colormap(vmax=df[metric].max())
+                else:  
+                    cmap='rocket'
+                    norm=None
+                plot_heatmap(d, ax, metric, vmax=df[metric].max(), mask=mask, cmap=cmap, norm=norm)
 
 
-    axes[0,0].set_title('Growth'),9
+    axes[0,0].set_title('Growth')
     axes[0,1].set_title('Acetate Secretion')
     axes[0,2].set_title('RQ')
 
@@ -220,3 +250,27 @@ def fig_1_plot(df):
     plt.tight_layout(rect=[0.1, 0, 1, 0.95])
     plt.show()
     return df
+
+def get_unity_colormap(palette='rocket',vmin=0,vmax=10,blend_width=10):
+    # Load the colormap from seaborn
+    rocket = sns.color_palette(palette, as_cmap=True)
+
+    # Define a custom colormap by blending inferno with pink at the center
+    colors = rocket(np.linspace(0, 1, 256))
+    
+    center_index = int(256/(vmax-vmin))  # Approximate midpoint index in the colors array
+    # Define pink as RGBA and create a gradient blend with the original colormap
+    pink_rgba = np.array(np.array([255, 36, 228, 1])/255)  # RGBA for pink
+
+
+    # Blend colors around the center with pink by gradually interpolating
+    for i in range(-blend_width, blend_width + 1):
+        # Compute the blending ratio (gradual transition around 1)
+        ratio = (blend_width - abs(i)) / blend_width
+        colors[center_index + i] = ratio * pink_rgba + (1 - ratio) * colors[center_index + i]
+
+    cmap = LinearSegmentedColormap.from_list("unity", colors)
+    norm = None#TwoSlopeNorm(vmin=vmin, vcenter=1, vmax=vmax)
+
+    return cmap, norm
+
