@@ -20,6 +20,66 @@ def build_BOF(model, df, name, reaction_name):
     reaction.add_metabolites({model.metabolites.get_by_id(met.replace('[', '_').replace(']', '')): stoch for stoch, met in zip(data[name], data['index'])})
     return reaction
 
+
+def build_HIP_BOF(model: cobra.Model, alpha: float, bof1_id: str, bof2_id: str):
+    reaction = cobra.Reaction(
+        id=f"BIOMASS_HIP_{alpha:>.3f}", name=f"BIOMASS_HIP_{alpha:>.3f}"
+    )
+    bof1 = model.reactions.get_by_id(bof1_id)
+    bof2 = model.reactions.get_by_id(bof2_id)
+
+    # Add metabolites and their stoichiometric coefficients
+    for met in set(bof1.metabolites.keys()) | set(bof2.metabolites.keys()):
+        stoch1 = bof1.metabolites.get(met, 0)
+        stoch2 = bof2.metabolites.get(met, 0)
+
+        stoch = alpha * stoch1 + (1 - alpha) * stoch2
+        reaction.add_metabolites({met: stoch})
+    return reaction
+
+
+def set_all_BOFs_to_zero(model):
+    for reaction in model.reactions:
+        if reaction.id.startswith("BIOMASS"):
+            reaction.bounds = (0, 0)
+
+
+def run_BOF_test(
+    model: cobra.Model, BOF: str, glucose: float, ammonium: float, tol: float = 1e-3
+) -> tuple[float, float, float]:
+    set_all_BOFs_to_zero(model)
+
+    model.reactions.get_by_id("EX_glc__D_e").bounds = (glucose, glucose)
+    model.reactions.get_by_id("EX_nh4_e").bounds = (ammonium, ammonium)
+    model.reactions.get_by_id("EX_ac_e").bounds = (0, 1000)
+    model.reactions.get_by_id(BOF).bounds = (0, 1000)
+
+    best_growth = 0
+
+    # Step 1: Maximize growth (BOF)
+    growth_flux = FBA(model, BOF)
+    if growth_flux < tol or best_growth > growth_flux:
+        return 0, 0, 0
+
+    # Step 2: Fix the growth rate to the optimized value
+    model.reactions.get_by_id(BOF).bounds = (growth_flux, growth_flux)
+
+    # Step 3: Maximize acetate secretion
+    acetate_flux = FBA(model, "EX_ac_e")
+
+    # Step 4: Fix acetate secretion rate
+    model.reactions.get_by_id("EX_ac_e").bounds = (acetate_flux, acetate_flux)
+
+    # Step 5: Perform parsimonious FBA (pFBA)
+    rq = pFBA_rq(model, BOF)
+    
+    # reset bounds
+    model.reactions.get_by_id(BOF).bounds = (0, 1000)
+    model.reactions.get_by_id("EX_ac_e").bounds = (0, 1000)
+
+    return growth_flux, acetate_flux, rq
+
+
 def BOF_test(model, objective, BOF, BOF_bounds = (0,1000)):
     model.objective = objective
     model.reactions.get_by_id(BOF).bounds = BOF_bounds
@@ -273,4 +333,3 @@ def get_unity_colormap(palette='rocket',vmin=0,vmax=10,blend_width=10):
     norm = None#TwoSlopeNorm(vmin=vmin, vcenter=1, vmax=vmax)
 
     return cmap, norm
-
